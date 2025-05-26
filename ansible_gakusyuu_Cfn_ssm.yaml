@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Ansible Test Environment with Master and Target EC2 Instances (SSM connection, no SSH needed) for Ireland (eu-west-1)
+
+Parameters:
+  KeyPairName:
+    Description: "The name of an existing key pair to use for EC2 instances (not used for SSH in SSM connection)."
+    Type: AWS::EC2::KeyPair::KeyName
+
+Resources:
+  # SSM Role and Instance Profile for Master
+  AnsibleMasterSSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  AnsibleMasterSSMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref AnsibleMasterSSMRole
+
+  # --- VPC and Networking ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Ansible-VPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Ansible-PublicSubnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Ansible-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Ansible-PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group for Target Instances
+  AnsibleTargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: AnsibleTargetSG
+      GroupDescription: Allow SSH and ICMP from Master only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.1.100/32
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.1.100/32
+      Tags:
+        - Key: Name
+          Value: AnsibleTarget-SG
+
+  # EC2 Instances
+  AnsibleMasterInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      ImageId: !FindInMap [RegionToAL2AMI, !Ref "AWS::Region", AMI]
+      IamInstanceProfile: !Ref AnsibleMasterSSMInstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          PrivateIpAddress: 10.0.1.100
+          SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: Ansible_Master
+
+  AnsibleDevTarget1Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      ImageId: !FindInMap [RegionToAL2AMI, !Ref "AWS::Region", AMI]
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          PrivateIpAddress: 10.0.1.101
+          GroupSet:
+            - !Ref AnsibleTargetSecurityGroup
+          SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: Ansible_Dev_Target1
+
+  AnsibleDevTarget2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      ImageId: !FindInMap [RegionToAL2AMI, !Ref "AWS::Region", AMI]
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          PrivateIpAddress: 10.0.1.102
+          GroupSet: [!Ref AnsibleTargetSecurityGroup]
+          SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: Ansible_Dev_Target2
+
+  AnsibleTestTarget1Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      ImageId: !FindInMap [RegionToAL2AMI, !Ref "AWS::Region", AMI]
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          PrivateIpAddress: 10.0.1.103
+          GroupSet: [!Ref AnsibleTargetSecurityGroup]
+          SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: Ansible_Test_Target1
+
+  AnsibleTestTarget2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      ImageId: !FindInMap [RegionToAL2AMI, !Ref "AWS::Region", AMI]
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          PrivateIpAddress: 10.0.1.104
+          GroupSet: [!Ref AnsibleTargetSecurityGroup]
+          SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: Ansible_Test_Target2
+
+Outputs:
+  AnsibleMasterInstanceId:
+    Description: Instance ID of the Ansible Master server
+    Value: !Ref AnsibleMasterInstance
+  # Add outputs for target instance IPs if needed for initial ec2-user login. 
+
+Mappings:
+  RegionToAL2AMI:
+    us-east-1:      { AMI: "ami-0d5688bba1210af52" }
+    eu-west-1:      { AMI: "ami-0d5688bba1210af52" }
+    ap-northeast-1: { AMI: "ami-0d5688bba1210af52" }
+    # Add other regions as needed. All use the same Amazon Linux 2 AMI for now. 
