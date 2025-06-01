@@ -1,0 +1,262 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Ansible Test Environment with Master and Target EC2 Instances (SSM connection, with detailed Ansible setup)
+
+Parameters:
+  KeyPairName:
+    Description: "The name of an existing key pair to use for EC2 instances."
+    Type: AWS::EC2::KeyPair::KeyName
+
+Resources:
+  # SSM Role and Instance Profile for Master
+  AnsibleMasterSSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  AnsibleMasterSSMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref AnsibleMasterSSMRole
+
+  # --- VPC and Networking ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Ansible-VPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Ansible-PublicSubnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Ansible-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Ansible-PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group for Target Instances
+  AnsibleTargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: AnsibleTargetSG
+      GroupDescription: Allow SSH and ICMP from Master only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.1.100/32
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.1.100/32
+      Tags:
+        - Key: Name
+          Value: AnsibleTarget-SG
+
+  # EC2 Instances
+  AnsibleMasterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: AnsibleMasterSG
+      GroupDescription: Allow SSM and outbound internet
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: AnsibleMaster-SG
+
+  AnsibleMasterInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      ImageId: ami-05f861f26432a5eed
+      IamInstanceProfile: !Ref AnsibleMasterSSMInstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          PrivateIpAddress: 10.0.1.100
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref AnsibleMasterSecurityGroup
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash -xe
+          # SSMエージェントのインストール
+          dnf install -y wget
+          wget https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+          dnf install -y amazon-ssm-agent.rpm
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+
+          # Ansibleをインストール
+          dnf install -y ansible-core
+
+          # rootユーザーの.sshディレクトリの作成
+          mkdir -p /root/.ssh
+
+          # rootユーザー用の秘密鍵ファイル作成
+          cat > /root/.ssh/ansible-test.pem << 'EOL'
+          -----BEGIN RSA PRIVATE KEY-----
+          # ここに実際の秘密鍵の内容を入れてください
+          -----END RSA PRIVATE KEY-----
+          EOL
+
+          # 秘密鍵のパーミッションを設定
+          chmod 600 /root/.ssh/ansible-test.pem
+
+          # Ansible用ディレクトリを作成
+          mkdir -p /root/ansible
+
+          # インベントリファイルを作成
+          cat > /root/ansible/inventory.ini << 'EOL'
+          [dev_servers]
+          ansible-dev-target1 ansible_host=10.0.1.101 ansible_connection=ssh ansible_user=ec2-user
+          ansible-dev-target2 ansible_host=10.0.1.102 ansible_connection=ssh ansible_user=ec2-user
+
+          [test_servers]
+          ansible-test-target1 ansible_host=10.0.1.103 ansible_connection=ssh ansible_user=ec2-user
+          ansible-test-target2 ansible_host=10.0.1.104 ansible_connection=ssh ansible_user=ec2-user
+
+          [all_targets:children]
+          dev_servers
+          test_servers
+          EOL
+
+          # SSHエージェント設定を.bashrcに追加
+          cat >> /root/.bashrc << 'EOL'
+
+          # SSHエージェントの自動起動と鍵の追加
+          if [ -z "$SSH_AUTH_SOCK" ]; then
+            eval $(ssh-agent -s) > /dev/null
+            ssh-add ~/.ssh/ansible-test.pem 2>/dev/null
+          fi
+          EOL
+      Tags:
+        - Key: Name
+          Value: Ansible_Master
+
+  AnsibleDevTarget1Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      ImageId: ami-05f861f26432a5eed
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          PrivateIpAddress: 10.0.1.101
+          GroupSet:
+            - !Ref AnsibleTargetSecurityGroup
+          SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: Ansible_Dev_Target1
+
+  AnsibleDevTarget2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      ImageId: ami-05f861f26432a5eed
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          PrivateIpAddress: 10.0.1.102
+          GroupSet: [!Ref AnsibleTargetSecurityGroup]
+          SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: Ansible_Dev_Target2
+
+  AnsibleTestTarget1Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      ImageId: ami-05f861f26432a5eed
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          PrivateIpAddress: 10.0.1.103
+          GroupSet: [!Ref AnsibleTargetSecurityGroup]
+          SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: Ansible_Test_Target1
+
+  AnsibleTestTarget2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      ImageId: ami-05f861f26432a5eed
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          PrivateIpAddress: 10.0.1.104
+          GroupSet: [!Ref AnsibleTargetSecurityGroup]
+          SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: Ansible_Test_Target2
+
+Outputs:
+  AnsibleMasterInstanceId:
+    Description: Instance ID of the Ansible Master server
+    Value: !Ref AnsibleMasterInstance 
