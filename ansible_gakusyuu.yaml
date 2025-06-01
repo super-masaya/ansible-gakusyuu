@@ -137,34 +137,40 @@ Resources:
       UserData:
         Fn::Base64: |
           #!/bin/bash -xe
-          # SSMエージェントのインストール
+          # Install SSM Agent
           dnf install -y wget
           wget https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
           dnf install -y amazon-ssm-agent.rpm
           systemctl enable amazon-ssm-agent
           systemctl start amazon-ssm-agent
 
-          # Ansibleをインストール
+          # Install Ansible
           dnf install -y ansible-core
 
-          # rootユーザーの.sshディレクトリの作成
-          mkdir -p /root/.ssh
+          # Create ansible user
+          useradd ansible
+          echo "ansible ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ansible
+          chmod 440 /etc/sudoers.d/ansible
 
-          # rootユーザー用の秘密鍵ファイル作成
-          cat > /root/.ssh/ansible-test.pem << 'EOL'
+          # Create directory for ansible user
+          mkdir -p /home/ansible/.ssh
+          
+          # Create private key file for ansible user
+          cat > /home/ansible/.ssh/ansible-test.pem << 'EOL'
           -----BEGIN RSA PRIVATE KEY-----
-          # ここに実際の秘密鍵の内容を入れてください
+          # Insert the actual private key content here
           -----END RSA PRIVATE KEY-----
           EOL
 
-          # 秘密鍵のパーミッションを設定
-          chmod 600 /root/.ssh/ansible-test.pem
+          # Set permissions for the private key
+          chmod 600 /home/ansible/.ssh/ansible-test.pem
+          chown -R ansible:ansible /home/ansible/.ssh
 
-          # Ansible用ディレクトリを作成
-          mkdir -p /root/ansible
+          # Create Ansible directory
+          mkdir -p /home/ansible/ansible
 
-          # インベントリファイルを作成
-          cat > /root/ansible/inventory.ini << 'EOL'
+          # Create inventory file
+          cat > /home/ansible/ansible/inventory.ini << 'EOL'
           [dev_servers]
           ansible-dev-target1 ansible_host=10.0.1.101 ansible_connection=ssh ansible_user=ec2-user
           ansible-dev-target2 ansible_host=10.0.1.102 ansible_connection=ssh ansible_user=ec2-user
@@ -178,15 +184,41 @@ Resources:
           test_servers
           EOL
 
-          # SSHエージェント設定を.bashrcに追加
-          cat >> /root/.bashrc << 'EOL'
+          # Change ownership of the directory
+          chown -R ansible:ansible /home/ansible/ansible
 
-          # SSHエージェントの自動起動と鍵の追加
+          # Add SSH agent configuration to .bashrc
+          cat >> /home/ansible/.bashrc << 'EOL'
+
+          # Automatically start SSH agent and add key
           if [ -z "$SSH_AUTH_SOCK" ]; then
             eval $(ssh-agent -s) > /dev/null
             ssh-add ~/.ssh/ansible-test.pem 2>/dev/null
           fi
           EOL
+
+          # Change ownership of .bashrc
+          chown ansible:ansible /home/ansible/.bashrc
+          
+          # Set 755 permissions to ansible user directory
+          chmod -R 755 /home/ansible
+          chmod -R 755 /home/ansible/ansible
+          
+          # Reset private key permissions to 600 (for security)
+          chmod 700 /home/ansible/.ssh
+          chmod 600 /home/ansible/.ssh/ansible-test.pem
+          
+          # Create Ansible configuration file to skip SSH host verification (placed in home directory)
+          cat > /home/ansible/.ansible.cfg << 'EOL'
+          [defaults]
+          host_key_checking = False
+          
+          [ssh_connection]
+          ssh_args = -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          EOL
+          
+          # Change ownership of the configuration file
+          chown ansible:ansible /home/ansible/.ansible.cfg
       Tags:
         - Key: Name
           Value: Ansible_Master
